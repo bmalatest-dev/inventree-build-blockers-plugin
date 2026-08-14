@@ -1,0 +1,48 @@
+# InvenTree Build Blockers plugin packaging
+
+[build-system]
+requires = ["setuptools", "twine", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inventree-build-blockers"
+description = "Export Build Order component blockers with purchase order target dates"
+dynamic = ["version"]
+authors = [
+    { name = "Per Vices Corporation" },
+]
+readme = "README.md"
+license = "MIT"
+keywords = ["inventree", "plugin", "manufacturing", "build", "blockers"]
+requires-python = ">=3.9"
+dependencies = [
+    "djangorestframework",
+    "tablib",
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Framework :: InvenTree",
+]
+
+[project.entry-points."inventree_plugins"]
+build-blockers = "build_blockers.build_blockers:BuildBlockers"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "build_blockers.PLUGIN_VERSION"}
+
+[tool.ruff]
+exclude = [
+    ".git",
+    "__pycache__",
+    "test.py",
+    "tests",
+    "venv",
+    "env",
+    ".venv",
+    ".env",
+]

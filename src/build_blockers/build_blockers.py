@@ -7,8 +7,15 @@ from rest_framework import serializers
 from plugin import InvenTreePlugin
 from plugin.mixins import DataExportMixin
 
-from build.models import BuildLine
-from build.serializers import BuildLineSerializer
+from build.models import Build, BuildLine
+from build.serializers import BuildLineSerializer, BuildSerializer
+
+try:
+    from build.status_codes import BuildStatus
+    BUILD_PRODUCTION_STATUS = BuildStatus.PRODUCTION.value
+except ImportError:
+    # Compatibility fallback for older InvenTree installations.
+    BUILD_PRODUCTION_STATUS = 20
 from order.models import PurchaseOrderLineItem
 
 try:
@@ -70,9 +77,17 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
     ExportOptionsSerializer = BuildBlockerExporterOptionsSerializer
 
     def supports_export(self, model_class: type, user, *args, **kwargs) -> bool:
-        """Expose this exporter only for Build Order line-item exports."""
+        """Expose on both Build lines and the Build Order list.
+
+        * BuildLine export: existing single-Build-Order behaviour.
+        * Build export: combined report for all Build Orders in Production.
+        """
         serializer_class = kwargs.get("serializer_class")
-        return model_class == BuildLine and serializer_class == BuildLineSerializer
+        return (
+            model_class == BuildLine and serializer_class == BuildLineSerializer
+        ) or (
+            model_class == Build and serializer_class == BuildSerializer
+        )
 
     def update_headers(self, headers, context, **kwargs):
         """Set blocker-specific export headers."""
@@ -100,6 +115,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         headers["po_references"] = "Purchase Orders"
         headers["po_detail"] = "PO Detail"
 
+        headers["coverage_source"] = "Coverage Source"
         headers["blocker"] = "Blocking"
 
         return headers
@@ -184,6 +200,160 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                     )
 
         return max_variant, max_substitute
+
+    def _alternate_parts(self, build_line):
+        """Return independently acceptable alternate Parts for a BOM line.
+
+        The returned list contains exact Part objects. Stock from different
+        Parts is never pooled to satisfy one requirement.
+        """
+        bom_item = build_line.bom_item
+        base_part = bom_item.sub_part
+
+        variants = []
+        substitutes = []
+
+        if bom_item.allow_variants:
+            variants.extend(base_part.get_descendants(include_self=False))
+
+        for substitute_link in bom_item.substitutes.select_related("part").all():
+            substitute = substitute_link.part
+            substitutes.append(substitute)
+
+            if bom_item.allow_variants:
+                substitutes.extend(
+                    substitute.get_descendants(include_self=False)
+                )
+
+        # Preserve order while removing duplicate Part PKs.
+        def unique(parts):
+            seen = set()
+            result = []
+            for part in parts:
+                if part.pk in seen:
+                    continue
+                seen.add(part.pk)
+                result.append(part)
+            return result
+
+        return unique(variants), unique(substitutes)
+
+    def _pool_quantity(self, pool, part, build=None):
+        """Return a cached free-stock quantity for one exact Part."""
+        if part is None:
+            return Decimal("0")
+
+        # take_from can make availability Build-specific, so include it in
+        # the pool key. Normally this is None and stock is globally shared.
+        location = getattr(build, "take_from", None) if build else None
+        location_pk = getattr(location, "pk", None)
+        key = (part.pk, location_pk)
+
+        if key not in pool:
+            pool[key] = self._exact_part_available_stock(part, build)
+
+        return pool[key]
+
+    def _consume_pool(self, pool, part, quantity, build=None):
+        """Virtually consume exact-Part stock from the combined report pool."""
+        location = getattr(build, "take_from", None) if build else None
+        location_pk = getattr(location, "pk", None)
+        key = (part.pk, location_pk)
+        pool[key] = max(
+            Decimal("0"),
+            self._pool_quantity(pool, part, build) - quantity,
+        )
+
+    def _combined_source_check(self, build_line, remaining_requirement, pool):
+        """Check one Production BO line against a shared virtual stock pool.
+
+        A requirement may be covered by exactly one source: the direct Part,
+        one acceptable variant, or one acceptable substitute. Sources are not
+        mixed. When a source covers a line, its stock is virtually consumed so
+        it cannot also clear another Production Build Order.
+        """
+        if remaining_requirement <= 0:
+            return {
+                "blocking": False,
+                "direct": Decimal("0"),
+                "max_variant": Decimal("0"),
+                "max_substitute": Decimal("0"),
+                "source": "Already consumed / allocated",
+            }
+
+        part = build_line.bom_item.sub_part
+        build = build_line.build
+        variants, substitutes = self._alternate_parts(build_line)
+
+        direct = self._pool_quantity(pool, part, build)
+        variant_rows = [
+            (candidate, self._pool_quantity(pool, candidate, build))
+            for candidate in variants
+        ]
+        substitute_rows = [
+            (candidate, self._pool_quantity(pool, candidate, build))
+            for candidate in substitutes
+        ]
+
+        max_variant = max(
+            (qty for _, qty in variant_rows),
+            default=Decimal("0"),
+        )
+        max_substitute = max(
+            (qty for _, qty in substitute_rows),
+            default=Decimal("0"),
+        )
+
+        # Prefer the direct Part. For alternates, use the smallest single stock
+        # pool that can fully cover the line (best-fit), preserving larger pools
+        # for later BO lines where possible.
+        chosen = None
+        source_label = ""
+
+        if direct >= remaining_requirement:
+            chosen = part
+            source_label = "Direct"
+        else:
+            eligible_variants = [
+                row for row in variant_rows if row[1] >= remaining_requirement
+            ]
+            eligible_substitutes = [
+                row for row in substitute_rows if row[1] >= remaining_requirement
+            ]
+
+            eligible = [
+                (candidate, qty, "Variant")
+                for candidate, qty in eligible_variants
+            ] + [
+                (candidate, qty, "Substitute")
+                for candidate, qty in eligible_substitutes
+            ]
+
+            if eligible:
+                candidate, _, source_type = min(
+                    eligible,
+                    key=lambda row: (row[1], row[0].pk),
+                )
+                chosen = candidate
+                source_label = f"{source_type}: {getattr(candidate, 'IPN', '') or candidate.pk}"
+
+        if chosen is not None:
+            self._consume_pool(pool, chosen, remaining_requirement, build)
+            return {
+                "blocking": False,
+                "direct": direct,
+                "max_variant": max_variant,
+                "max_substitute": max_substitute,
+                "source": source_label,
+            }
+
+        return {
+            "blocking": True,
+            "direct": direct,
+            "max_variant": max_variant,
+            "max_substitute": max_substitute,
+            "source": "",
+        }
 
     def _purchase_order_data(
         self,
@@ -300,63 +470,32 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             "detail": "; ".join(detail_parts),
         }
 
-    def export_data(
+    def _build_row(
         self,
-        queryset,
+        build_line,
         serializer_class,
-        headers,
-        context,
-        output,
-        **kwargs,
+        include_all_open_po_statuses,
+        combined_pool=None,
     ):
-        """Generate blocker rows."""
-        blockers_only = context.get("blockers_only", True)
-        include_optional = context.get("include_optional", False)
-        include_all_open_po_statuses = context.get(
-            "include_all_open_po_statuses",
-            True,
+        """Build one report row, or return None for an excluded optional line."""
+        data = serializer_class(build_line, exporting=True).data
+
+        required = self._decimal(data.get("quantity"))
+        consumed = self._decimal(data.get("consumed"))
+        allocated = self._decimal(data.get("allocated"))
+        available = self._decimal(data.get("available_stock"))
+        substitute_stock = self._decimal(data.get("available_substitute_stock"))
+        variant_stock = self._decimal(data.get("available_variant_stock"))
+
+        remaining_requirement = max(
+            Decimal("0"),
+            required - consumed - allocated,
         )
 
-        queryset = queryset.select_related(
-            "build",
-            "bom_item",
-            "bom_item__sub_part",
-            "bom_item__sub_part__category",
-        )
-
-        rows = []
-
-        for build_line in queryset:
-            data = serializer_class(build_line, exporting=True).data
-
-            optional = bool(data.get("optional", False))
-
-            if optional and not include_optional:
-                continue
-
-            required = self._decimal(data.get("quantity"))
-            consumed = self._decimal(data.get("consumed"))
-            allocated = self._decimal(data.get("allocated"))
-            available = self._decimal(data.get("available_stock"))
-            substitute_stock = self._decimal(
-                data.get("available_substitute_stock")
-            )
-            variant_stock = self._decimal(
-                data.get("available_variant_stock")
-            )
-
-            remaining_requirement = max(
-                Decimal("0"),
-                required - consumed - allocated,
-            )
-
-            # A line is only a blocker when no single acceptable source can
-            # independently cover the remaining requirement. Direct stock,
-            # variants and substitutes are intentionally NOT pooled together.
+        if combined_pool is None:
             max_variant_stock, max_substitute_stock = self._single_alternate_stock(
                 build_line
             )
-
             direct_covers = available >= remaining_requirement
             variant_covers = max_variant_stock >= remaining_requirement
             substitute_covers = max_substitute_stock >= remaining_requirement
@@ -366,66 +505,143 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                 and not variant_covers
                 and not substitute_covers
             )
+            coverage_source = ""
+            if remaining_requirement <= 0:
+                coverage_source = "Already consumed / allocated"
+            elif direct_covers:
+                coverage_source = "Direct"
+            elif variant_covers:
+                coverage_source = "Variant"
+            elif substitute_covers:
+                coverage_source = "Substitute"
+        else:
+            combined = self._combined_source_check(
+                build_line,
+                remaining_requirement,
+                combined_pool,
+            )
+            blocking = combined["blocking"]
+            available = combined["direct"]
+            max_variant_stock = combined["max_variant"]
+            max_substitute_stock = combined["max_substitute"]
+            coverage_source = combined["source"]
 
-            # Keep the existing Blocker Qty / PO calculations based on the
-            # direct-part shortage. If an alternate independently covers the
-            # requirement, the row is suppressed in Blockers Only mode.
-            uncovered = max(
-                Decimal("0"),
-                remaining_requirement - available,
+        # Preserve the existing PO calculation: PO coverage is for the base
+        # direct Part shortage only, and is informational rather than stock.
+        uncovered = max(
+            Decimal("0"),
+            remaining_requirement - available,
+        )
+
+        part = build_line.bom_item.sub_part
+        po = self._purchase_order_data(
+            part.pk,
+            uncovered,
+            include_all_open_statuses=include_all_open_po_statuses,
+        )
+
+        return {
+            "build_reference": getattr(build_line.build, "reference", ""),
+            "ipn": getattr(part, "IPN", ""),
+            "part_name": getattr(part, "name", ""),
+            "part_description": getattr(part, "description", ""),
+            "required_quantity": required,
+            "consumed_quantity": consumed,
+            "allocated_quantity": allocated,
+            "available_stock": available,
+            "available_substitute_stock": substitute_stock,
+            "available_variant_stock": variant_stock,
+            "max_single_substitute_stock": max_substitute_stock,
+            "max_single_variant_stock": max_variant_stock,
+            "uncovered_quantity": uncovered,
+            "po_outstanding_quantity": po["outstanding"],
+            "po_coverage_quantity": po["coverage"],
+            "po_remaining_shortage": po["remaining"],
+            "earliest_po_date": (
+                po["earliest_date"].isoformat() if po["earliest_date"] else ""
+            ),
+            "full_coverage_po_date": (
+                po["full_coverage_date"].isoformat()
+                if po["full_coverage_date"]
+                else ""
+            ),
+            "po_references": po["references"],
+            "po_detail": po["detail"],
+            "coverage_source": coverage_source,
+            "blocker": "YES" if blocking else "NO",
+            "_blocking": blocking,
+        }
+
+    def export_data(
+        self,
+        queryset,
+        serializer_class,
+        headers,
+        context,
+        output,
+        **kwargs,
+    ):
+        """Generate blocker rows for one BO or all Production BOs."""
+        blockers_only = context.get("blockers_only", True)
+        include_optional = context.get("include_optional", False)
+        include_all_open_po_statuses = context.get(
+            "include_all_open_po_statuses",
+            True,
+        )
+
+        combined_mode = serializer_class == BuildSerializer
+
+        if combined_mode:
+            # Define "open" for this report as exactly Production. This is
+            # intentionally independent of the current Build table filters:
+            # invoking the exporter from the Build Orders table always reports
+            # every Build Order whose status is Production.
+            production_builds = Build.objects.filter(
+                status=BUILD_PRODUCTION_STATUS,
             )
 
-            if blockers_only and not blocking:
+            line_queryset = BuildLine.objects.filter(
+                build__in=production_builds,
+            )
+            line_serializer = BuildLineSerializer
+            combined_pool = {}
+        else:
+            line_queryset = queryset
+            line_serializer = serializer_class
+            combined_pool = None
+
+        line_queryset = (
+            line_queryset.select_related(
+                "build",
+                "bom_item",
+                "bom_item__sub_part",
+                "bom_item__sub_part__category",
+            )
+            .prefetch_related(
+                "bom_item__substitutes__part",
+            )
+            .order_by("build__reference", "pk")
+        )
+
+        rows = []
+
+        for build_line in line_queryset:
+            data = line_serializer(build_line, exporting=True).data
+            optional = bool(data.get("optional", False))
+            if optional and not include_optional:
                 continue
 
-            part = build_line.bom_item.sub_part
-
-            po = self._purchase_order_data(
-                part.pk,
-                uncovered,
-                include_all_open_statuses=include_all_open_po_statuses,
+            row = self._build_row(
+                build_line,
+                line_serializer,
+                include_all_open_po_statuses,
+                combined_pool=combined_pool,
             )
 
-            rows.append(
-                {
-                    "build_reference": getattr(
-                        build_line.build,
-                        "reference",
-                        "",
-                    ),
-                    "ipn": getattr(part, "IPN", ""),
-                    "part_name": getattr(part, "name", ""),
-                    "part_description": getattr(
-                        part,
-                        "description",
-                        "",
-                    ),
-                    "required_quantity": required,
-                    "consumed_quantity": consumed,
-                    "allocated_quantity": allocated,
-                    "available_stock": available,
-                    "available_substitute_stock": substitute_stock,
-                    "available_variant_stock": variant_stock,
-                    "max_single_substitute_stock": max_substitute_stock,
-                    "max_single_variant_stock": max_variant_stock,
-                    "uncovered_quantity": uncovered,
-                    "po_outstanding_quantity": po["outstanding"],
-                    "po_coverage_quantity": po["coverage"],
-                    "po_remaining_shortage": po["remaining"],
-                    "earliest_po_date": (
-                        po["earliest_date"].isoformat()
-                        if po["earliest_date"]
-                        else ""
-                    ),
-                    "full_coverage_po_date": (
-                        po["full_coverage_date"].isoformat()
-                        if po["full_coverage_date"]
-                        else ""
-                    ),
-                    "po_references": po["references"],
-                    "po_detail": po["detail"],
-                    "blocker": "YES" if blocking else "NO",
-                }
-            )
+            if blockers_only and not row["_blocking"]:
+                continue
+
+            row.pop("_blocking", None)
+            rows.append(row)
 
         return rows

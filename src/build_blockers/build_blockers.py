@@ -599,36 +599,52 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         if all_production_builds:
             # "Open" for this report means exactly the standard Production
             # status, rather than all active / outstanding Build statuses.
+            #
+            # Walk each Build's reverse ``build_lines`` relation rather than
+            # constructing a separate cross-Build queryset. This is more
+            # robust across InvenTree versions and guarantees that the objects
+            # processed below are BuildLine instances.
             production_builds = Build.objects.filter(
                 status=BUILD_PRODUCTION_STATUS,
-            )
+            ).order_by("reference", "pk")
 
-            line_queryset = BuildLine.objects.filter(
-                build__in=production_builds,
-            )
             line_serializer = BuildLineSerializer
             combined_pool = {}
+            line_items = []
+
+            for build in production_builds:
+                build_lines = (
+                    build.build_lines.select_related(
+                        "build",
+                        "bom_item",
+                        "bom_item__sub_part",
+                        "bom_item__sub_part__category",
+                    )
+                    .prefetch_related(
+                        "bom_item__substitutes__part",
+                    )
+                    .order_by("pk")
+                )
+                line_items.extend(build_lines)
         else:
-            line_queryset = queryset
             line_serializer = serializer_class
             combined_pool = None
-
-        line_queryset = (
-            line_queryset.select_related(
-                "build",
-                "bom_item",
-                "bom_item__sub_part",
-                "bom_item__sub_part__category",
+            line_items = (
+                queryset.select_related(
+                    "build",
+                    "bom_item",
+                    "bom_item__sub_part",
+                    "bom_item__sub_part__category",
+                )
+                .prefetch_related(
+                    "bom_item__substitutes__part",
+                )
+                .order_by("build__reference", "pk")
             )
-            .prefetch_related(
-                "bom_item__substitutes__part",
-            )
-            .order_by("build__reference", "pk")
-        )
 
         rows = []
 
-        for build_line in line_queryset:
+        for build_line in line_items:
             data = line_serializer(build_line, exporting=True).data
             optional = bool(data.get("optional", False))
             if optional and not include_optional:

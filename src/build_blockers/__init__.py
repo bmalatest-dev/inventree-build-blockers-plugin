@@ -1,2 +1,2 @@
 """InvenTree Build Blockers plugin."""
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "0.2.4"

@@ -485,9 +485,13 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         """Build one report row, or return None for an excluded optional line."""
         data = serializer_class(build_line, exporting=True).data
 
-        required = self._decimal(data.get("quantity"))
-        consumed = self._decimal(data.get("consumed"))
-        allocated = self._decimal(data.get("allocated"))
+        # Use the BuildLine model as the authoritative source for requirement,
+        # consumption and allocation. The serializer `allocated` value is an
+        # annotation which is present on the individual BO API queryset but is
+        # not guaranteed on BuildLines collected directly for combined mode.
+        required = self._decimal(build_line.quantity)
+        consumed = self._decimal(build_line.consumed)
+        allocated = self._decimal(build_line.allocated_quantity())
         available = self._decimal(data.get("available_stock"))
         substitute_stock = self._decimal(data.get("available_substitute_stock"))
         variant_stock = self._decimal(data.get("available_variant_stock"))

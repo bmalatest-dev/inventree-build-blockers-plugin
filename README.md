@@ -44,10 +44,10 @@ PO information remains informational and is calculated against the base direct P
 
 ## Version
 
-0.2.3
+0.2.4
 
 
-## v0.2.3 combined Production mode
+## v0.2.4 combined Production mode
 
 The exporter remains registered only against the Build Order Required Parts / BuildLine table.
 

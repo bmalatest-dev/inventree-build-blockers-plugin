@@ -34,7 +34,7 @@ from . import PLUGIN_VERSION
 class BuildBlockerExporterOptionsSerializer(serializers.Serializer):
     """Options displayed in the export dialog."""
 
-    blockers_only = serializers.BooleanField(
+    export_blockers_only = serializers.BooleanField(
         default=True,
         label="Blockers Only",
         help_text=(
@@ -43,13 +43,13 @@ class BuildBlockerExporterOptionsSerializer(serializers.Serializer):
         ),
     )
 
-    include_optional = serializers.BooleanField(
+    export_include_optional = serializers.BooleanField(
         default=False,
         label="Include Optional BOM Items",
         help_text="Allow optional BOM items to appear as blockers.",
     )
 
-    all_production_builds = serializers.BooleanField(
+    export_all_production_builds = serializers.BooleanField(
         default=False,
         label="All Production Build Orders",
         help_text=(
@@ -58,7 +58,7 @@ class BuildBlockerExporterOptionsSerializer(serializers.Serializer):
         ),
     )
 
-    include_all_open_po_statuses = serializers.BooleanField(
+    export_include_all_open_po_statuses = serializers.BooleanField(
         default=True,
         label="Include Pending / On-Hold POs",
         help_text=(
@@ -92,8 +92,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         Production Build Order. Keeping the exporter attached only to the
         BuildLine endpoint avoids relying on the Build-list export hook.
         """
-        serializer_class = kwargs.get("serializer_class")
-        return model_class == BuildLine and serializer_class == BuildLineSerializer
+        return model_class in (BuildLine, Build)
 
     def update_headers(self, headers, context, **kwargs):
         """Set blocker-specific export headers."""
@@ -588,13 +587,25 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         **kwargs,
     ):
         """Generate blocker rows for one BO or all Production BOs."""
-        blockers_only = context.get("blockers_only", True)
-        include_optional = context.get("include_optional", False)
+        blockers_only = context.get("export_blockers_only", context.get("blockers_only", True))
+        include_optional = context.get("export_include_optional", context.get("include_optional", False))
         include_all_open_po_statuses = context.get(
-            "include_all_open_po_statuses",
-            True,
+            "export_include_all_open_po_statuses",
+            context.get("include_all_open_po_statuses", True),
         )
-        all_production_builds = context.get("all_production_builds", False)
+
+        # On the main Build Orders endpoint the incoming queryset contains Build
+        # objects, not BuildLine objects. Treat that endpoint as an implicit
+        # request for the combined Production report. On an individual BO's
+        # Required Parts endpoint, the checkbox controls combined mode.
+        queryset_model = getattr(queryset, "model", None)
+        all_production_builds = (
+            queryset_model == Build
+            or context.get(
+                "export_all_production_builds",
+                context.get("all_production_builds", False),
+            )
+        )
 
         if all_production_builds:
             # "Open" for this report means exactly the standard Production
@@ -626,7 +637,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                     .order_by("pk")
                 )
                 line_items.extend(build_lines)
-        else:
+        elif queryset_model == BuildLine:
             line_serializer = serializer_class
             combined_pool = None
             line_items = (
@@ -641,6 +652,10 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                 )
                 .order_by("build__reference", "pk")
             )
+        else:
+            # Defensive fallback: never apply BuildLine field paths to a Build
+            # queryset. Returning no rows is safer than crashing an export task.
+            return []
 
         rows = []
 

@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="inventree-build-blockers",
-    version="0.2.2",
+    version="0.2.3",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     include_package_data=True,

@@ -8,7 +8,7 @@ from plugin import InvenTreePlugin
 from plugin.mixins import DataExportMixin
 
 from build.models import Build, BuildLine
-from build.serializers import BuildLineSerializer, BuildSerializer
+from build.serializers import BuildLineSerializer
 
 try:
     from build.status_codes import BuildStatus
@@ -49,6 +49,15 @@ class BuildBlockerExporterOptionsSerializer(serializers.Serializer):
         help_text="Allow optional BOM items to appear as blockers.",
     )
 
+    all_production_builds = serializers.BooleanField(
+        default=False,
+        label="All Production Build Orders",
+        help_text=(
+            "Ignore the currently opened Build Order and run the blocker report "
+            "against all Build Orders whose status is Production."
+        ),
+    )
+
     include_all_open_po_statuses = serializers.BooleanField(
         default=True,
         label="Include Pending / On-Hold POs",
@@ -77,17 +86,14 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
     ExportOptionsSerializer = BuildBlockerExporterOptionsSerializer
 
     def supports_export(self, model_class: type, user, *args, **kwargs) -> bool:
-        """Expose on both Build lines and the Build Order list.
+        """Expose this exporter only for Build Order required-part lines.
 
-        * BuildLine export: existing single-Build-Order behaviour.
-        * Build export: combined report for all Build Orders in Production.
+        The export dialog itself provides an option to run against every
+        Production Build Order. Keeping the exporter attached only to the
+        BuildLine endpoint avoids relying on the Build-list export hook.
         """
         serializer_class = kwargs.get("serializer_class")
-        return (
-            model_class == BuildLine and serializer_class == BuildLineSerializer
-        ) or (
-            model_class == Build and serializer_class == BuildSerializer
-        )
+        return model_class == BuildLine and serializer_class == BuildLineSerializer
 
     def update_headers(self, headers, context, **kwargs):
         """Set blocker-specific export headers."""
@@ -588,14 +594,11 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             "include_all_open_po_statuses",
             True,
         )
+        all_production_builds = context.get("all_production_builds", False)
 
-        combined_mode = serializer_class == BuildSerializer
-
-        if combined_mode:
-            # Define "open" for this report as exactly Production. This is
-            # intentionally independent of the current Build table filters:
-            # invoking the exporter from the Build Orders table always reports
-            # every Build Order whose status is Production.
+        if all_production_builds:
+            # "Open" for this report means exactly the standard Production
+            # status, rather than all active / outstanding Build statuses.
             production_builds = Build.objects.filter(
                 status=BUILD_PRODUCTION_STATUS,
             )

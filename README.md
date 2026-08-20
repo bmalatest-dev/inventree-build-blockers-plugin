@@ -8,7 +8,7 @@ InvenTree data-export plugin for identifying Build Order component blockers.
 Open a Build Order, go to Required Parts / Line Items, choose Export Data, then choose **Build Blockers**.
 
 ### All Production Build Orders
-Go to the main Build Orders table, choose Export Data, then choose **Build Blockers**.
+Go to the main Build Order Required Parts export, choose Export Data, then choose **Build Blockers**.
 
 In this mode the plugin automatically evaluates **all Build Orders with status Production**. Pending, On Hold, Complete and Cancelled Build Orders are excluded.
 
@@ -44,4 +44,19 @@ PO information remains informational and is calculated against the base direct P
 
 ## Version
 
-0.2.0
+0.2.1
+
+
+## v0.2.1 combined Production mode
+
+The exporter remains registered only against the Build Order Required Parts / BuildLine table.
+
+To run a combined report:
+
+1. Open any Build Order.
+2. Open Required Parts.
+3. Select Export Data -> Build Blockers.
+4. Enable **All Production Build Orders**.
+5. Run the export.
+
+When enabled, the currently opened Build Order is ignored and the plugin evaluates all Build Orders with the standard **Production** status (code 20). Shared free stock is virtually consumed as the report is calculated so the same stock cannot clear multiple Production Build Orders. No real InvenTree allocations are changed.

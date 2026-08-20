@@ -32,7 +32,7 @@ class BuildBlockerExporterOptionsSerializer(serializers.Serializer):
         label="Blockers Only",
         help_text=(
             "Only export components which cannot currently be satisfied "
-            "by consumed quantity, allocation, or available stock."
+            "by consumed quantity, allocation, direct stock, or a single approved alternate."
         ),
     )
 
@@ -88,6 +88,8 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         headers["available_stock"] = "Available Stock"
         headers["available_substitute_stock"] = "Available Substitute Stock"
         headers["available_variant_stock"] = "Available Variant Stock"
+        headers["max_single_substitute_stock"] = "Max Single Substitute Stock"
+        headers["max_single_variant_stock"] = "Max Single Variant Stock"
         headers["uncovered_quantity"] = "Blocker Qty"
 
         headers["po_outstanding_quantity"] = "Open PO Qty"
@@ -117,6 +119,71 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
     def _effective_po_date(line):
         """Use line target date, falling back to parent PO target date."""
         return line.target_date or getattr(line.order, "target_date", None)
+
+
+    def _exact_part_available_stock(self, part, build=None):
+        """Return available stock for one exact Part, never pooling variants.
+
+        This intentionally mirrors InvenTree's basic availability semantics:
+        in-stock quantity less existing build / sales allocations. If the Build
+        Order has a take-from location, stock quantity is restricted to that
+        location tree.
+        """
+        if part is None:
+            return Decimal("0")
+
+        location = getattr(build, "take_from", None) if build else None
+        entries = part.stock_entries(
+            include_variants=False,
+            in_stock=True,
+            location=location,
+        )
+        total = sum(
+            (self._decimal(item.quantity) for item in entries),
+            Decimal("0"),
+        )
+        allocated = self._decimal(
+            part.allocation_count(include_variants=False)
+        )
+        return max(Decimal("0"), total - allocated)
+
+    def _single_alternate_stock(self, build_line):
+        """Return the best independently usable variant and substitute stock.
+
+        Stock is evaluated per exact Part. Quantities from two different
+        variants or substitutes are never added together.
+        """
+        bom_item = build_line.bom_item
+        base_part = bom_item.sub_part
+        build = build_line.build
+
+        max_variant = Decimal("0")
+        if bom_item.allow_variants:
+            for variant in base_part.get_descendants(include_self=False):
+                max_variant = max(
+                    max_variant,
+                    self._exact_part_available_stock(variant, build),
+                )
+
+        max_substitute = Decimal("0")
+        for substitute_link in bom_item.substitutes.select_related("part").all():
+            substitute = substitute_link.part
+            max_substitute = max(
+                max_substitute,
+                self._exact_part_available_stock(substitute, build),
+            )
+
+            # InvenTree permits variants of an explicit substitute when the
+            # BOM line itself allows variants. Treat each such Part as its own
+            # independent option; never pool them with the substitute parent.
+            if bom_item.allow_variants:
+                for sub_variant in substitute.get_descendants(include_self=False):
+                    max_substitute = max(
+                        max_substitute,
+                        self._exact_part_available_stock(sub_variant, build),
+                    )
+
+        return max_variant, max_substitute
 
     def _purchase_order_data(
         self,
@@ -283,12 +350,32 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                 required - consumed - allocated,
             )
 
+            # A line is only a blocker when no single acceptable source can
+            # independently cover the remaining requirement. Direct stock,
+            # variants and substitutes are intentionally NOT pooled together.
+            max_variant_stock, max_substitute_stock = self._single_alternate_stock(
+                build_line
+            )
+
+            direct_covers = available >= remaining_requirement
+            variant_covers = max_variant_stock >= remaining_requirement
+            substitute_covers = max_substitute_stock >= remaining_requirement
+            blocking = (
+                remaining_requirement > 0
+                and not direct_covers
+                and not variant_covers
+                and not substitute_covers
+            )
+
+            # Keep the existing Blocker Qty / PO calculations based on the
+            # direct-part shortage. If an alternate independently covers the
+            # requirement, the row is suppressed in Blockers Only mode.
             uncovered = max(
                 Decimal("0"),
                 remaining_requirement - available,
             )
 
-            if blockers_only and uncovered <= 0:
+            if blockers_only and not blocking:
                 continue
 
             part = build_line.bom_item.sub_part
@@ -319,6 +406,8 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                     "available_stock": available,
                     "available_substitute_stock": substitute_stock,
                     "available_variant_stock": variant_stock,
+                    "max_single_substitute_stock": max_substitute_stock,
+                    "max_single_variant_stock": max_variant_stock,
                     "uncovered_quantity": uncovered,
                     "po_outstanding_quantity": po["outstanding"],
                     "po_coverage_quantity": po["coverage"],
@@ -335,7 +424,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                     ),
                     "po_references": po["references"],
                     "po_detail": po["detail"],
-                    "blocker": "YES" if uncovered > 0 else "NO",
+                    "blocker": "YES" if blocking else "NO",
                 }
             )
 

@@ -44,7 +44,7 @@ PO information remains informational and is calculated against the base direct P
 
 ## Version
 
-0.2.4
+0.2.5
 
 
 ## v0.2.4 combined Production mode
@@ -60,3 +60,8 @@ To run a combined report:
 5. Run the export.
 
 When enabled, the currently opened Build Order is ignored and the plugin evaluates all Build Orders with the standard **Production** status (code 20). Shared free stock is virtually consumed as the report is calculated so the same stock cannot clear multiple Production Build Orders. No real InvenTree allocations are changed.
+
+
+## v0.2.5 performance update
+
+No blocker or PO date business rules changed. Combined Production mode now loads all Production BuildLines in one queryset, serializes each BuildLine once, and preloads relevant open PO lines in one query instead of querying purchase-order lines once per BuildLine. This is intended to reduce export time on production-sized databases while preserving the v0.2.4 output and shared virtual-stock behavior.

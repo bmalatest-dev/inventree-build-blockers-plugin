@@ -365,6 +365,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         part_id,
         shortage,
         include_all_open_statuses=True,
+        po_line_cache=None,
     ):
         """Return open PO supply for the required base part."""
         if not part_id:
@@ -384,19 +385,22 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             else [PO_PLACED_STATUS]
         )
 
-        lines = (
-            PurchaseOrderLineItem.objects.filter(
-                part__part_id=part_id,
-                order__status__in=statuses,
+        if po_line_cache is not None:
+            lines = po_line_cache.get(part_id, ())
+        else:
+            lines = (
+                PurchaseOrderLineItem.objects.filter(
+                    part__part_id=part_id,
+                    order__status__in=statuses,
+                )
+                .select_related("order", "part", "part__supplier")
+                .order_by(
+                    "target_date",
+                    "order__target_date",
+                    "order__reference",
+                    "pk",
+                )
             )
-            .select_related("order", "part", "part__supplier")
-            .order_by(
-                "target_date",
-                "order__target_date",
-                "order__reference",
-                "pk",
-            )
-        )
 
         po_rows = []
         total_outstanding = Decimal("0")
@@ -481,9 +485,15 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
         serializer_class,
         include_all_open_po_statuses,
         combined_pool=None,
+        serialized_data=None,
+        po_line_cache=None,
     ):
         """Build one report row, or return None for an excluded optional line."""
-        data = serializer_class(build_line, exporting=True).data
+        data = (
+            serialized_data
+            if serialized_data is not None
+            else serializer_class(build_line, exporting=True).data
+        )
 
         # Use the BuildLine model as the authoritative source for requirement,
         # consumption and allocation. The serializer `allocated` value is an
@@ -547,6 +557,7 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             part.pk,
             uncovered,
             include_all_open_statuses=include_all_open_po_statuses,
+            po_line_cache=po_line_cache,
         )
 
         return {
@@ -615,32 +626,26 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             # "Open" for this report means exactly the standard Production
             # status, rather than all active / outstanding Build statuses.
             #
-            # Walk each Build's reverse ``build_lines`` relation rather than
-            # constructing a separate cross-Build queryset. This is more
-            # robust across InvenTree versions and guarantees that the objects
-            # processed below are BuildLine instances.
-            production_builds = Build.objects.filter(
-                status=BUILD_PRODUCTION_STATUS,
-            ).order_by("reference", "pk")
-
+            # Load all Production BuildLines in one queryset. The previous
+            # implementation walked each Build's reverse relation separately,
+            # causing one BuildLine query per Production BO.
             line_serializer = BuildLineSerializer
             combined_pool = {}
-            line_items = []
-
-            for build in production_builds:
-                build_lines = (
-                    build.build_lines.select_related(
-                        "build",
-                        "bom_item",
-                        "bom_item__sub_part",
-                        "bom_item__sub_part__category",
-                    )
-                    .prefetch_related(
-                        "bom_item__substitutes__part",
-                    )
-                    .order_by("pk")
+            line_items = list(
+                BuildLine.objects.filter(
+                    build__status=BUILD_PRODUCTION_STATUS,
                 )
-                line_items.extend(build_lines)
+                .select_related(
+                    "build",
+                    "bom_item",
+                    "bom_item__sub_part",
+                    "bom_item__sub_part__category",
+                )
+                .prefetch_related(
+                    "bom_item__substitutes__part",
+                )
+                .order_by("build__reference", "build__pk", "pk")
+            )
         elif queryset_model == BuildLine:
             line_serializer = serializer_class
             combined_pool = None
@@ -661,6 +666,41 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
             # queryset. Returning no rows is safer than crashing an export task.
             return []
 
+        # In combined mode, preload every relevant open PO line in one query.
+        # Previously _purchase_order_data() queried PurchaseOrderLineItem once
+        # per BuildLine, which dominates runtime on production-sized datasets.
+        po_line_cache = None
+        if combined_pool is not None:
+            part_ids = {
+                line.bom_item.sub_part_id
+                for line in line_items
+                if getattr(line, "bom_item_id", None)
+                and getattr(line.bom_item, "sub_part_id", None)
+            }
+            statuses = (
+                PO_OPEN_STATUSES
+                if include_all_open_po_statuses
+                else [PO_PLACED_STATUS]
+            )
+            po_line_cache = {part_id: [] for part_id in part_ids}
+            if part_ids:
+                po_lines = (
+                    PurchaseOrderLineItem.objects.filter(
+                        part__part_id__in=part_ids,
+                        order__status__in=statuses,
+                    )
+                    .select_related("order", "part", "part__supplier")
+                    .order_by(
+                        "part__part_id",
+                        "target_date",
+                        "order__target_date",
+                        "order__reference",
+                        "pk",
+                    )
+                )
+                for po_line in po_lines:
+                    po_line_cache.setdefault(po_line.part.part_id, []).append(po_line)
+
         rows = []
 
         for build_line in line_items:
@@ -674,6 +714,8 @@ class BuildBlockers(InvenTreePlugin, DataExportMixin):
                 line_serializer,
                 include_all_open_po_statuses,
                 combined_pool=combined_pool,
+                serialized_data=data,
+                po_line_cache=po_line_cache,
             )
 
             if blockers_only and not row["_blocking"]:
